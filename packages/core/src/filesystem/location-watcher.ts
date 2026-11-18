@@ -6,6 +6,7 @@ import { FileSystem } from "@opencode/schema/filesystem"
 import path from "path"
 import { Bus } from "../bus.js"
 import { FSUtil } from "@opencode/util/fs-util"
+import { Global } from "@opencode/util/global"
 import { Git } from "../git.js"
 import { Location } from "../location.js"
 import { Plugin } from "../plugin.js"
@@ -24,12 +25,34 @@ const layer = Layer.effect(
     const bus = yield* Bus.Service
     const fs = yield* FSUtil.Service
     const git = yield* Git.Service
+    const global = yield* Global.Service
     const policy = yield* LocationWatcherPolicy.Service
-    const publish = (update: { type: "create" | "update" | "delete"; path: string }) =>
-      bus.publish(FileSystem.Event.Changed, {
-        file: update.path,
-        event: update.type === "create" ? "add" : update.type === "update" ? "change" : "unlink",
-      })
+    const directory = path.resolve(location.directory)
+    // The service also loads the home directory for global requests. Never watch it or a drive root recursively.
+    const watchWorkspace =
+      !location.workspaceID && directory !== path.parse(directory).root && !FSUtil.contains(directory, global.home)
+    const internalDirectories = [global.data, global.cache, global.state].filter((entry) =>
+      FSUtil.contains(directory, entry),
+    )
+    const start = Effect.fnUntraced(function* (input: Watcher.WatchInput) {
+      const scope = yield* Scope.make()
+      yield* Effect.gen(function* () {
+        const updates = yield* watcher.subscribe(input)
+        yield* Stream.runForEach(updates, (update) =>
+          bus.publish(FileSystem.Event.Changed, {
+            file: update.path,
+            event: update.type === "create" ? "add" : update.type === "update" ? "change" : "unlink",
+          }),
+        )
+      }).pipe(
+        Effect.catchCauseIf(
+          (cause) => !Cause.hasInterrupts(cause),
+          (cause) => Effect.logError("location watcher subscription failed", { path: input.path, cause }),
+        ),
+        Effect.forkIn(scope, { startImmediately: true }),
+      )
+      return scope
+    })
     const target = yield* Effect.cached(
       Effect.gen(function* () {
         if (location.vcs?.type === "git") {
@@ -51,7 +74,8 @@ const layer = Layer.effect(
     )
     const lock = Semaphore.makeUnsafe(1)
     let stopped = false
-    let active: { path: string; scope: Scope.Closeable } | undefined
+    let metadata: { path: string; scope: Scope.Closeable } | undefined
+    let workspace: { key: string; scope: Scope.Closeable } | undefined
     const reconcile = () =>
       lock.withPermit(
         Effect.gen(function* () {
@@ -59,30 +83,28 @@ const layer = Layer.effect(
           const resolved = yield* target
           const ignore = policy.current()
           const next = resolved && !resolved.aliases.some((alias) => ignore.includes(alias)) ? resolved.path : undefined
-          if (active?.path === next) return
-          if (active) yield* Scope.close(active.scope, Exit.void)
-          active = undefined
-          if (!next) return
-          const scope = yield* Scope.make()
-          active = { path: next, scope }
-          yield* Effect.gen(function* () {
-            const updates = yield* watcher.subscribe({ path: next, type: "file" })
-            yield* Stream.runForEach(updates, publish)
-          }).pipe(
-            Effect.catchCauseIf(
-              (cause) => !Cause.hasInterrupts(cause),
-              (cause) => Effect.logError("location watcher subscription failed", { path: next, cause }),
-            ),
-            Effect.forkIn(scope, { startImmediately: true }),
-          )
+          if (metadata?.path !== next) {
+            if (metadata) yield* Scope.close(metadata.scope, Exit.void)
+            metadata = next ? { path: next, scope: yield* start({ path: next, type: "file" }) } : undefined
+          }
+          if (!watchWorkspace) return
+
+          // Branch metadata has its own file subscription. App data and logs can change in response to these events.
+          const ignored = [
+            ...new Set([...FSUtil.ignoreGlobs, ".hg", "**/.hg/**", ...internalDirectories, ...ignore]),
+          ].toSorted()
+          const key = JSON.stringify(ignored)
+          if (workspace?.key === key) return
+          if (workspace) yield* Scope.close(workspace.scope, Exit.void)
+          workspace = { key, scope: yield* start({ path: directory, type: "directory", ignore: ignored }) }
         }).pipe(Effect.withSpan("LocationWatcher.reconcile", { attributes: { directory: location.directory } })),
       )
     yield* Effect.addFinalizer(() =>
       lock.withPermit(
         Effect.gen(function* () {
           stopped = true
-          if (active) yield* Scope.close(active.scope, Exit.void)
-          active = undefined
+          if (metadata) yield* Scope.close(metadata.scope, Exit.void)
+          if (workspace) yield* Scope.close(workspace.scope, Exit.void)
         }),
       ),
     )
@@ -104,5 +126,14 @@ const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Watcher.node, FSUtil.node, Location.node, Git.node, Bus.node, Plugin.node, LocationWatcherPolicy.node],
+  deps: [
+    Watcher.node,
+    FSUtil.node,
+    Location.node,
+    Git.node,
+    Global.node,
+    Bus.node,
+    Plugin.node,
+    LocationWatcherPolicy.node,
+  ],
 })

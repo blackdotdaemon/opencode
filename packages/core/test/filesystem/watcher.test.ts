@@ -323,7 +323,7 @@ function withTmp<A, E, R>(
 }
 
 describe("LocationWatcher subscriptions", () => {
-  it.live("watches only exact Git branch metadata", () => {
+  it.live("watches exact Git branch metadata separately from workspace files", () => {
     const subscriptions: Watcher.WatchInput[] = []
     const watcher = Layer.succeed(
       Watcher.Service,
@@ -336,17 +336,19 @@ describe("LocationWatcher subscriptions", () => {
         Effect.gen(function* () {
           yield* LocationWatcher.Service
           yield* Effect.sync(() => subscriptions.length).pipe(
-            Effect.filterOrFail((count) => count > 0),
+            Effect.filterOrFail((count) => count === 2),
             Effect.retry(Schedule.spaced("10 millis")),
           )
-          yield* Effect.sleep("10 millis")
-          expect(subscriptions).toEqual([{ path: path.join(directory, ".git", "HEAD"), type: "file" }])
+          expect(subscriptions).toEqual([
+            { path: path.join(directory, ".git", "HEAD"), type: "file" },
+            { path: directory, type: "directory", ignore: expect.arrayContaining([".git", "node_modules"]) },
+          ])
         }),
       { vcs: "git", watcher },
     )
   })
 
-  it.live("watches only exact Hg branch metadata", () => {
+  it.live("watches exact Hg branch metadata separately from workspace files", () => {
     const subscriptions: Watcher.WatchInput[] = []
     const watcher = Layer.succeed(
       Watcher.Service,
@@ -359,11 +361,13 @@ describe("LocationWatcher subscriptions", () => {
         Effect.gen(function* () {
           yield* LocationWatcher.Service
           yield* Effect.sync(() => subscriptions.length).pipe(
-            Effect.filterOrFail((count) => count > 0),
+            Effect.filterOrFail((count) => count === 2),
             Effect.retry(Schedule.spaced("10 millis")),
           )
-          yield* Effect.sleep("10 millis")
-          expect(subscriptions).toEqual([{ path: path.join(directory, ".hg", "branch"), type: "file" }])
+          expect(subscriptions).toEqual([
+            { path: path.join(directory, ".hg", "branch"), type: "file" },
+            { path: directory, type: "directory", ignore: expect.arrayContaining([".hg"]) },
+          ])
         }),
       { vcs: "hg", watcher },
     )
@@ -405,17 +409,17 @@ describe("LocationWatcher subscriptions", () => {
             const policy = yield* LocationWatcherPolicy.Service
             const bus = yield* Bus.Service
             yield* Effect.sync(() => subscriptions.length).pipe(
-              Effect.filterOrFail((count) => count === 1),
+              Effect.filterOrFail((count) => count === 2),
               Effect.retry(Schedule.spaced("10 millis")),
             )
-            expect(counts.active).toBe(1)
+            expect(counts.active).toBe(2)
 
             entries.current = [new Document({ type: "document", info: new Info({ watcher: { ignore: [".git"] } }) })]
             yield* ConfigLocationWatcherPlugin.Plugin.effect(
               host({ event: { subscribe: () => bus.subscribe(Event.Updated) } }),
             )
             yield* Effect.sync(() => counts.active).pipe(
-              Effect.filterOrFail((count) => count === 0),
+              Effect.filterOrFail((count) => count === 1),
               Effect.retry(Schedule.spaced("10 millis")),
             )
             expect(counts.released).toBe(1)
@@ -423,18 +427,18 @@ describe("LocationWatcher subscriptions", () => {
             entries.current = []
             yield* bus.publish(Event.Updated, {})
             yield* Effect.sync(() => subscriptions.length).pipe(
-              Effect.filterOrFail((count) => count === 2),
+              Effect.filterOrFail((count) => count === 3),
               Effect.retry(Schedule.spaced("10 millis")),
             )
-            expect(counts.active).toBe(1)
+            expect(counts.active).toBe(2)
 
             yield* policy.reload()
-            expect(subscriptions).toHaveLength(2)
+            expect(subscriptions).toHaveLength(3)
           }),
         { vcs: "git", watcher, config },
       )
       expect(counts.active).toBe(0)
-      expect(counts.released).toBe(2)
+      expect(counts.released).toBe(3)
     })
   })
 
@@ -457,12 +461,14 @@ describe("LocationWatcher subscriptions", () => {
             expect(policy.current()).toEqual([".hg"])
             yield* Deferred.succeed(release, undefined)
             const registration = yield* Fiber.join(update)
-            expect(subscriptions).toEqual([])
+            expect(subscriptions).toEqual([
+              { path: directory, type: "directory", ignore: expect.arrayContaining([".hg"]) },
+            ])
 
             yield* registration.dispose
             yield* Deferred.await(subscribed)
             yield* policy.reload()
-            expect(subscriptions).toEqual([{ path: path.join(directory, ".hg", "branch"), type: "file" }])
+            expect(subscriptions[1]).toEqual({ path: path.join(directory, ".hg", "branch"), type: "file" })
             expect(released).toBe(0)
           }),
         {
@@ -485,14 +491,14 @@ describe("LocationWatcher subscriptions", () => {
             Watcher.Service.of({
               subscribe: (input) =>
                 Effect.sync(() => subscriptions.push(input)).pipe(
-                  Effect.andThen(Deferred.succeed(subscribed, undefined)),
+                  Effect.andThen(input.type === "file" ? Deferred.succeed(subscribed, undefined) : Effect.void),
                   Effect.as(Stream.never.pipe(Stream.ensuring(Effect.sync(() => released++)))),
                 ),
             }),
           ),
         },
       )
-      expect(released).toBe(1)
+      expect(released).toBe(2)
     }),
   )
 
@@ -515,11 +521,16 @@ describe("LocationWatcher subscriptions", () => {
       deps: [LocationWatcherPolicy.node],
     })
     return withTmp(
-      () =>
+      (directory) =>
         Effect.gen(function* () {
           yield* LocationWatcher.Service
-          yield* Effect.sleep("50 millis")
-          expect(subscriptions).toEqual([])
+          yield* Effect.sync(() => subscriptions.length).pipe(
+            Effect.filterOrFail((count) => count > 0),
+            Effect.retry(Schedule.spaced("10 millis")),
+          )
+          expect(subscriptions).toEqual([
+            { path: directory, type: "directory", ignore: expect.arrayContaining([".git"]) },
+          ])
         }),
       { vcs: "git", watcher, plugins: PluginSupervisor.node.replace(plugins) },
     )
@@ -588,6 +599,29 @@ function ready(file: string, eventFile = file) {
 }
 
 describeNative("LocationWatcher", () => {
+  it.live("publishes changes to files in a workspace without Git", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        const fs = yield* FSUtil.Service
+        const nested = path.join(directory, "src")
+        const file = path.join(nested, "new.ts")
+        yield* fs.ensureDir(nested)
+        yield* ready(path.join(directory, "ready.txt"))
+
+        for (const [event, change] of [
+          ["add", fs.writeFileString(file, "export const value = 1\n")],
+          ["change", fs.writeFileString(file, "export const value = 10\n")],
+          ["unlink", fs.remove(file)],
+        ] as const) {
+          expect(yield* nextUpdate((update) => update.file === file && update.event === event, change)).toEqual({
+            file,
+            event,
+          })
+        }
+      }),
+    ),
+  )
+
   it.live("limits file watches to the exact target", () =>
     withTmp((directory) =>
       Effect.gen(function* () {
@@ -695,7 +729,9 @@ describeNative("LocationWatcher", () => {
             subscribe: (input, onReady) =>
               service.subscribe(
                 input,
-                Deferred.succeed(started, input.path).pipe(Effect.andThen(onReady ?? Effect.void)),
+                input.type === "file"
+                  ? Deferred.succeed(started, input.path).pipe(Effect.andThen(onReady ?? Effect.void))
+                  : onReady,
               ),
           })
         }),

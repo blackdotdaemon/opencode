@@ -89,6 +89,10 @@ export function decodeFilePath(input: string) {
 }
 
 export function createPathHelpers(scope: () => string) {
+  /** Whether a normalized path points outside the workspace root. */
+  const absolute = (path: string) =>
+    path.startsWith("skill://") || /^[A-Za-z]:[/\\]/.test(path) || path.startsWith("/") || path.startsWith("\\\\")
+
   const normalize = (input: string) => {
     const root = scope()
 
@@ -108,7 +112,6 @@ export function createPathHelpers(scope: () => string) {
       canonPath.startsWith(canonRoot) &&
       (canonRoot.endsWith("/") || canonPath === canonRoot || canonPath[canonRoot.length] === "/")
     ) {
-      // Slice from original path to preserve native separators, then drop the separator itself.
       path = path.slice(root.length).replace(/^[/\\]/, "")
     }
 
@@ -116,13 +119,9 @@ export function createPathHelpers(scope: () => string) {
       path = path.slice(2)
     }
 
-    // An absolute path that is not under the root stays absolute; it is a file outside the workspace.
-    return path
+    // File tabs and native watcher events need the same cache key for Windows workspace files.
+    return windows && !absolute(path) ? path.replace(/\\/g, "/") : path
   }
-
-  /** Whether a normalized path points outside the workspace root. */
-  const absolute = (path: string) =>
-    path.startsWith("skill://") || /^[A-Za-z]:[/\\]/.test(path) || path.startsWith("/") || path.startsWith("\\\\")
 
   const normalizeDir = (input: string) => {
     const path = normalize(input)
