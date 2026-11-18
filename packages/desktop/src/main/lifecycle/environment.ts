@@ -45,13 +45,16 @@ export const preferApplicationEnvironment = Effect.gen(function* () {
   const shell = process.platform === "win32" ? null : getUserShell()
   const shellEnv = shell ? yield* loadShellEnv(shell) : null
   yield* Effect.sync(() => {
-    if (!shellEnv?.XDG_STATE_HOME) delete process.env.XDG_STATE_HOME
+    const hasIsolatedProfile = process.env.OPENCODE_DESKTOP_TEST_ROOT || process.env.OPENCODE_TEST_ONBOARDING === "1"
+    const stateHome = hasIsolatedProfile ? process.env.XDG_STATE_HOME : shellEnv?.XDG_STATE_HOME
+    if (!stateHome) delete process.env.XDG_STATE_HOME
     Object.assign(process.env, {
       ...shellEnv,
       OPENCODE_EXPERIMENTAL_ICON_DISCOVERY: "true",
       OPENCODE_EXPERIMENTAL_FILEWATCHER: "true",
       OPENCODE_CLIENT: "desktop",
     })
+    if (stateHome) process.env.XDG_STATE_HOME = stateHome
   })
 })
 
